@@ -1588,15 +1588,40 @@ impl FixedSizeListArray {
 }
 
 impl ListArray {
+    // --- List cast helpers ---
+
+    /// Keep strict child conversions from inspecting values belonging to omitted rows.
+    fn cast_visible_child(&self, dtype: &DataType) -> DaftResult<(Series, OffsetBuffer<i64>)> {
+        let offsets = self.offsets();
+        let start = offsets[0];
+        let end = offsets[self.len()];
+        if start == 0 && end as usize == self.flat_child.len() {
+            return Ok((self.flat_child.cast(dtype)?, offsets.clone()));
+        }
+
+        let child = self
+            .flat_child
+            .slice(start as usize, end as usize)?
+            .cast(dtype)?;
+        let offsets =
+            OffsetBuffer::new(offsets.iter().map(|o| o - start).collect::<Vec<_>>().into());
+        Ok((child, offsets))
+    }
+
+    // --- End list cast helpers ---
+
     pub fn cast(&self, dtype: &DataType) -> DaftResult<Series> {
         match dtype {
-            DataType::List(child_dtype) => Ok(Self::new(
-                Field::new(self.name(), dtype.clone()),
-                self.flat_child.cast(child_dtype.as_ref())?,
-                self.offsets().clone(),
-                self.nulls().cloned(),
-            )
-            .into_series()),
+            DataType::List(child_dtype) => {
+                let (child, offsets) = self.cast_visible_child(child_dtype)?;
+                Ok(Self::new(
+                    Field::new(self.name(), dtype.clone()),
+                    child,
+                    offsets,
+                    self.nulls().cloned(),
+                )
+                .into_series())
+            }
             DataType::FixedSizeList(child_dtype, size) => {
                 // Validate lengths of elements are equal to `size`
                 let lengths_ok = match self.nulls() {
@@ -1615,25 +1640,16 @@ impl ListArray {
                 }
 
                 // Cast child
-                let mut casted_child = self.flat_child.cast(child_dtype.as_ref())?;
+                let (casted_child, offsets) = self.cast_visible_child(child_dtype)?;
                 // Build a FixedSizeListArray
                 match self.nulls() {
                     // All valid, easy conversion -- everything is correctly sized and valid
-                    None => {
-                        // Slice child to match offsets if necessary
-                        if casted_child.len() / size > self.len() {
-                            casted_child = casted_child.slice(
-                                *self.offsets().first().unwrap() as usize,
-                                *self.offsets().last().unwrap() as usize,
-                            )?;
-                        }
-                        Ok(FixedSizeListArray::new(
-                            Field::new(self.name(), dtype.clone()),
-                            casted_child,
-                            None,
-                        )
-                        .into_series())
-                    }
+                    None => Ok(FixedSizeListArray::new(
+                        Field::new(self.name(), dtype.clone()),
+                        casted_child,
+                        None,
+                    )
+                    .into_series()),
                     // Some invalids, we need to insert nulls into the child
                     // TODO(desmond): Migrate this to arrow-rs after migrating growable internals.
                     Some(nulls) => {
@@ -1649,7 +1665,7 @@ impl ListArray {
                         for (start, end) in nulls.valid_slices() {
                             let len = end - start;
                             child_growable.add_nulls((start - invalid_ptr) * size);
-                            let child_start = self.offsets().inner()[start] as usize;
+                            let child_start = offsets.inner()[start] as usize;
                             child_growable.extend(0, child_start, len * size);
                             invalid_ptr = end;
                         }
